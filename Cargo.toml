@@ -11,6 +11,9 @@ categories = ["parsing"]
 version = "0.9.8"
 include = ["src/**/*.rs", "Cargo.toml", "build.rs"]
 
+[[bin]]
+name = "clean"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 encoding_rs = "0.8"
