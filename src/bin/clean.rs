@@ -16,13 +16,13 @@ static DODGE_TYPE: &str = "Archetypes.CarComponents.CarComponent_Dodge";
 static CAR_TYPE: &str = "Archetypes.Car.Car_Default";
 static PLAYER_REPLICATION_KEY: &str = "Engine.Pawn:PlayerReplicationInfo";
 static PLAYER_TYPE: &str = "TAGame.Default__PRI_TA";
-static TEAM_TYPE: &str = "Engine.PlayerReplicationInfo:Team";
 static GAME_TYPE: &str = "Archetypes.GameEvent.GameEvent_Soccar";
 
 static BOOST_AMOUNT_KEY: &str = "TAGame.CarComponent_Boost_TA:ReplicatedBoostAmount";
 static LAST_BOOST_AMOUNT_KEY: &str = "TAGame.CarComponent_Boost_TA:ReplicatedBoostAmount.Last";
 static COMPONENT_ACTIVE_KEY: &str = "TAGame.CarComponent_TA:ReplicatedActive";
 static RIGID_BODY_STATE_KEY: &str = "TAGame.RBActor_TA:ReplicatedRBState";
+static TEAM_KEY: &str = "Engine.PlayerReplicationInfo:Team";
 static UNIQUE_ID_KEY: &str = "Engine.PlayerReplicationInfo:UniqueId";
 static VEHICLE_KEY: &str = "TAGame.CarComponent_TA:Vehicle";
 static SECONDS_REMAINING_KEY: &str = "TAGame.GameEvent_Soccar_TA:SecondsRemaining";
@@ -211,11 +211,12 @@ struct ReplayProcessor<'a> {
     name_to_object_id: HashMap<String, boxcars::ObjectId>,
     ball_actor_id: Option<boxcars::ActorId>,
     player_to_actor_id: HashMap<PlayerId, boxcars::ActorId>,
-    player_actor_to_car_actor: HashMap<boxcars::ActorId, boxcars::ActorId>,
-    car_actor_to_boost_actor: HashMap<boxcars::ActorId, boxcars::ActorId>,
-    car_actor_to_jump_actor: HashMap<boxcars::ActorId, boxcars::ActorId>,
-    car_actor_to_double_jump_actor: HashMap<boxcars::ActorId, boxcars::ActorId>,
-    car_actor_to_dodge_actor: HashMap<boxcars::ActorId, boxcars::ActorId>,
+    player_to_car: HashMap<boxcars::ActorId, boxcars::ActorId>,
+    player_to_team: HashMap<boxcars::ActorId, boxcars::ActorId>,
+    car_to_boost: HashMap<boxcars::ActorId, boxcars::ActorId>,
+    car_to_jump: HashMap<boxcars::ActorId, boxcars::ActorId>,
+    car_to_double_jump: HashMap<boxcars::ActorId, boxcars::ActorId>,
+    car_to_dodge: HashMap<boxcars::ActorId, boxcars::ActorId>,
 }
 
 impl<'a> ReplayProcessor<'a> {
@@ -234,12 +235,13 @@ impl<'a> ReplayProcessor<'a> {
             object_id_to_name,
             name_to_object_id,
             ball_actor_id: None,
-            player_actor_to_car_actor: HashMap::new(),
+            player_to_car: HashMap::new(),
+            player_to_team: HashMap::new(),
             player_to_actor_id: HashMap::new(),
-            car_actor_to_boost_actor: HashMap::new(),
-            car_actor_to_jump_actor: HashMap::new(),
-            car_actor_to_double_jump_actor: HashMap::new(),
-            car_actor_to_dodge_actor: HashMap::new(),
+            car_to_boost: HashMap::new(),
+            car_to_jump: HashMap::new(),
+            car_to_double_jump: HashMap::new(),
+            car_to_dodge: HashMap::new(),
         }
     }
 
@@ -255,7 +257,7 @@ impl<'a> ReplayProcessor<'a> {
         {
             println!("{}", index);
             self.actor_state.process_frame(frame)?;
-            self.update_player_to_car_mappings(frame)?;
+            self.update_mappings(frame)?;
             self.update_ball_id(frame)?;
             self.update_boost_amounts(frame)?;
             self.add_frame_to_replay_data(frame.time)?;
@@ -289,7 +291,7 @@ impl<'a> ReplayProcessor<'a> {
         println!("Seconds remaining: {:?}", seconds_remaining);
         Ok(MetadataFrame::new(
             time,
-            u8::try_from(*seconds_remaining).map_err(|_| "Seconds remaining conversion failed")?,
+            u32::try_from(*seconds_remaining).map_err(|_| "Seconds remaining conversion failed")?,
         ))
     }
 
@@ -302,10 +304,6 @@ impl<'a> ReplayProcessor<'a> {
     fn get_actor_ids_by_type(&self, name: &str) -> Result<&[boxcars::ActorId], String> {
         self.get_object_id_for_key(name)
             .map(|object_id| self.get_actor_ids_by_object_id(object_id))
-    }
-
-    fn get_actor_ids_vec(&self, name: &str) -> Result<Vec<boxcars::ActorId>, String> {
-        Ok(self.get_actor_ids_by_type(name)?.iter().cloned().collect())
     }
 
     fn get_actor_ids_by_object_id(&self, object_id: &boxcars::ObjectId) -> &[boxcars::ActorId] {
@@ -389,9 +387,9 @@ impl<'a> ReplayProcessor<'a> {
         }
     }
 
-    fn update_player_to_car_mappings(&mut self, frame: &boxcars::Frame) -> Result<(), String> {
+    fn update_mappings(&mut self, frame: &boxcars::Frame) -> Result<(), String> {
         for update in frame.updated_actors.iter() {
-            macro_rules! maintain_actor_link {
+            macro_rules! maintain_link {
                 ($map:expr, $actor_type:expr, $attr:expr, $get_key: expr, $type:path) => {{
                     if &update.object_id == self.get_object_id_for_key(&$attr)? {
                         if self
@@ -410,45 +408,41 @@ impl<'a> ReplayProcessor<'a> {
                     }
                 }};
             }
-            maintain_actor_link!(
-                self.player_actor_to_car_actor,
-                CAR_TYPE,
-                PLAYER_REPLICATION_KEY,
-                get_actor_id,
-                boxcars::Attribute::ActiveActor
-            );
-            maintain_actor_link!(
+            macro_rules! maintain_actor_link {
+                ($map:expr, $actor_type:expr, $attr:expr) => {
+                    maintain_link!(
+                        $map,
+                        $actor_type,
+                        $attr,
+                        get_actor_id,
+                        boxcars::Attribute::ActiveActor
+                    )
+                };
+            }
+            macro_rules! maintain_vehicle_key_link {
+                ($map:expr, $actor_type:expr) => {
+                    maintain_actor_link!($map, $actor_type, VEHICLE_KEY)
+                };
+            }
+            maintain_link!(
                 self.player_to_actor_id,
                 PLAYER_TYPE,
                 UNIQUE_ID_KEY,
                 |unique_id: &Box<boxcars::UniqueId>| *unique_id.clone(),
                 boxcars::Attribute::UniqueId
             );
-
-            macro_rules! maintain_vehicle_key_link {
-                ($map:expr, $actor_type:expr) => {
-                    maintain_actor_link!(
-                        $map,
-                        $actor_type,
-                        VEHICLE_KEY,
-                        get_actor_id,
-                        boxcars::Attribute::ActiveActor
-                    )
-                };
-            }
-
-            maintain_vehicle_key_link!(self.car_actor_to_boost_actor, BOOST_TYPE);
-            maintain_vehicle_key_link!(self.car_actor_to_dodge_actor, DODGE_TYPE);
-            maintain_vehicle_key_link!(self.car_actor_to_jump_actor, JUMP_TYPE);
-            maintain_vehicle_key_link!(self.car_actor_to_double_jump_actor, DOUBLE_JUMP_TYPE);
+            maintain_actor_link!(self.player_to_car, CAR_TYPE, PLAYER_REPLICATION_KEY);
+            maintain_actor_link!(self.player_to_team, PLAYER_TYPE, TEAM_KEY);
+            maintain_vehicle_key_link!(self.car_to_boost, BOOST_TYPE);
+            maintain_vehicle_key_link!(self.car_to_dodge, DODGE_TYPE);
+            maintain_vehicle_key_link!(self.car_to_jump, JUMP_TYPE);
+            maintain_vehicle_key_link!(self.car_to_double_jump, DOUBLE_JUMP_TYPE);
         }
 
         for actor_id in frame.deleted_actors.iter() {
-            self.player_actor_to_car_actor
-                .remove(actor_id)
-                .map(|car_id| {
-                    println!("Player actor {:?} deleted, car id: {:?}.", actor_id, car_id)
-                });
+            self.player_to_car.remove(actor_id).map(|car_id| {
+                println!("Player actor {:?} deleted, car id: {:?}.", actor_id, car_id)
+            });
         }
 
         Ok(())
@@ -552,19 +546,22 @@ impl<'a> ReplayProcessor<'a> {
             .ok_or(format!("Car actor not found for id: {:?}", car_actor_id))
     }
 
-    fn get_car_actor_id(&self, player_id: &PlayerId) -> Result<boxcars::ActorId, String> {
-        let player_actor_id = self
-            .player_to_actor_id
+    fn get_player_actor_id(&self, player_id: &PlayerId) -> Result<boxcars::ActorId, String> {
+        self.player_to_actor_id
             .get(&player_id)
-            .ok_or_else(|| format!("Could not find actor for player id {:?}", player_id))?;
-        self.player_actor_to_car_actor
-            .get(player_actor_id)
+            .ok_or_else(|| format!("Could not find actor for player id {:?}", player_id))
+            .cloned()
+    }
+
+    fn get_car_actor_id(&self, player_id: &PlayerId) -> Result<boxcars::ActorId, String> {
+        self.player_to_car
+            .get(&self.get_player_actor_id(player_id)?)
             .ok_or_else(|| format!("Car actor for player {:?} not known.", player_id))
             .cloned()
     }
 
     fn get_boost_actor_id(&self, player_id: &PlayerId) -> Result<boxcars::ActorId, String> {
-        self.car_actor_to_boost_actor
+        self.car_to_boost
             .get(&self.get_car_actor_id(player_id)?)
             .ok_or_else(|| format!("Boost actor for player {:?} not found", player_id))
             .cloned()
@@ -591,7 +588,11 @@ impl<'a> ReplayProcessor<'a> {
             BOOST_AMOUNT_KEY,
             boxcars::Attribute::Float
         )?;
-
+        println!(
+            "{:?}",
+            self.actor_state_string(&self.get_player_actor_id(player_id)?)
+        );
+        // println!("{:?}", self.map_attribute_keys(&car_state.attributes));
         println!("{:?}: {:?}", player_id, boost_amount * 100.0 / 255.0);
         Ok(PlayerFrame::from_data(rigid_body.clone(), *boost_amount))
     }
@@ -610,21 +611,6 @@ impl<'a> ReplayProcessor<'a> {
                 )
             })
             .collect())
-    }
-
-    fn map_attribute_keys(
-        &self,
-        hash_map: &HashMap<boxcars::ObjectId, boxcars::Attribute>,
-    ) -> Result<HashMap<String, boxcars::Attribute>, ()> {
-        hash_map
-            .iter()
-            .map(|(k, v)| {
-                self.object_id_to_name
-                    .get(k)
-                    .map(|name| (name.clone(), v.clone()))
-                    .ok_or(())
-            })
-            .collect()
     }
 
     fn iter_actors_by_type_err(
@@ -658,6 +644,21 @@ impl<'a> ReplayProcessor<'a> {
         actor_ids
             .iter()
             .map(move |id| (id, self.actor_state.actor_states.get(id).unwrap()))
+    }
+
+    fn map_attribute_keys(
+        &self,
+        hash_map: &HashMap<boxcars::ObjectId, boxcars::Attribute>,
+    ) -> Result<HashMap<String, boxcars::Attribute>, ()> {
+        hash_map
+            .iter()
+            .map(|(k, v)| {
+                self.object_id_to_name
+                    .get(k)
+                    .map(|name| (name.clone(), v.clone()))
+                    .ok_or(())
+            })
+            .collect()
     }
 
     fn actor_state_string(&self, actor_id: &boxcars::ActorId) -> String {
@@ -760,11 +761,11 @@ impl BallData {
 #[derive(Debug, Clone, PartialEq)]
 struct MetadataFrame {
     time: f32,
-    seconds_remaining: u8,
+    seconds_remaining: u32,
 }
 
 impl MetadataFrame {
-    fn new(time: f32, seconds_remaining: u8) -> Self {
+    fn new(time: f32, seconds_remaining: u32) -> Self {
         MetadataFrame {
             time,
             seconds_remaining,
@@ -807,6 +808,8 @@ impl ReplayData {
     }
 }
 
+struct ReplayDataBuilder {}
+
 fn main() {
     let data = include_bytes!("../../aeda154d-a79c-490c-8c7f-0b8e9e43479d.replay");
     let parsing = boxcars::ParserBuilder::new(&data[..])
@@ -814,15 +817,18 @@ fn main() {
         .must_parse_network_data()
         .parse();
     let replay = parsing.unwrap();
-
+    println!("{:?}", replay.properties);
     ReplayProcessor::new(&replay).get_data().unwrap();
 }
 
+// TODO: Generalize processor to handle creation of any datatype
 // TODO: handle car sleeping
-// TODO: Handle boost
+// DONE: Handle boost
 // TODO: frame metadata
 // TODO: Handle team assignment
 // TODO: handle headers
-// TODO: Handle jump
+// DONE: Handle jump
+
 // TODO: TAGame.RBActor_TA:bIgnoreSyncing
 // TODO: TAGame.GameEvent_Soccar_TA
+// TODO: demos
