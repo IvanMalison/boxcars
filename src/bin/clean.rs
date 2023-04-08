@@ -1,5 +1,5 @@
-use boxcars::{self, Frame};
-use std::collections::HashMap;
+use boxcars::{self, ActiveActor, Frame};
+use std::{collections::HashMap, convert::TryFrom};
 
 static BALL_TYPES: [&str; 5] = [
     "Archetypes.Ball.Ball_Default",
@@ -10,17 +10,26 @@ static BALL_TYPES: [&str; 5] = [
 ];
 
 static BOOST_TYPE: &str = "Archetypes.CarComponents.CarComponent_Boost";
+static JUMP_TYPE: &str = "Archetypes.CarComponents.CarComponent_Jump";
+static DOUBLE_JUMP_TYPE: &str = "Archetypes.CarComponents.CarComponent_DoubleJump";
+static DODGE_TYPE: &str = "Archetypes.CarComponents.CarComponent_Dodge";
 static CAR_TYPE: &str = "Archetypes.Car.Car_Default";
-static PLAYER_REPLICATION_TYPE: &str = "Engine.Pawn:PlayerReplicationInfo";
+static PLAYER_REPLICATION_KEY: &str = "Engine.Pawn:PlayerReplicationInfo";
 static PLAYER_TYPE: &str = "TAGame.Default__PRI_TA";
 static TEAM_TYPE: &str = "Engine.PlayerReplicationInfo:Team";
+static GAME_TYPE: &str = "Archetypes.GameEvent.GameEvent_Soccar";
 
 static BOOST_AMOUNT_KEY: &str = "TAGame.CarComponent_Boost_TA:ReplicatedBoostAmount";
+static LAST_BOOST_AMOUNT_KEY: &str = "TAGame.CarComponent_Boost_TA:ReplicatedBoostAmount.Last";
 static COMPONENT_ACTIVE_KEY: &str = "TAGame.CarComponent_TA:ReplicatedActive";
 static RIGID_BODY_STATE_KEY: &str = "TAGame.RBActor_TA:ReplicatedRBState";
 static UNIQUE_ID_KEY: &str = "Engine.PlayerReplicationInfo:UniqueId";
+static VEHICLE_KEY: &str = "TAGame.CarComponent_TA:Vehicle";
+static SECONDS_REMAINING_KEY: &str = "TAGame.GameEvent_Soccar_TA:SecondsRemaining";
 
 static EMPTY_ACTOR_IDS: [boxcars::ActorId; 0] = [];
+
+static BOOST_USED_PER_SECOND: f32 = 80.0 / 0.93;
 
 #[derive(PartialEq, Debug, Clone)]
 struct ActorState {
@@ -176,6 +185,24 @@ macro_rules! get_attribute {
     };
 }
 
+macro_rules! get_derived_attribute {
+    ($map:expr, $key:expr, $type:path) => {
+        $map.get($key)
+            .ok_or(format!("No value for key: {:?}", $key))
+            .and_then(|found| {
+                attribute_match!(
+                    found,
+                    $type,
+                    format!("Value for {:?} not of the expected type, {:?}", $key, $map)
+                )
+            })
+    };
+}
+
+fn get_actor_id(active_actor: &ActiveActor) -> boxcars::ActorId {
+    active_actor.actor
+}
+
 struct ReplayProcessor<'a> {
     replay: &'a boxcars::Replay,
     replay_data: ReplayData,
@@ -185,6 +212,10 @@ struct ReplayProcessor<'a> {
     ball_actor_id: Option<boxcars::ActorId>,
     player_to_actor_id: HashMap<PlayerId, boxcars::ActorId>,
     player_actor_to_car_actor: HashMap<boxcars::ActorId, boxcars::ActorId>,
+    car_actor_to_boost_actor: HashMap<boxcars::ActorId, boxcars::ActorId>,
+    car_actor_to_jump_actor: HashMap<boxcars::ActorId, boxcars::ActorId>,
+    car_actor_to_double_jump_actor: HashMap<boxcars::ActorId, boxcars::ActorId>,
+    car_actor_to_dodge_actor: HashMap<boxcars::ActorId, boxcars::ActorId>,
 }
 
 impl<'a> ReplayProcessor<'a> {
@@ -205,6 +236,10 @@ impl<'a> ReplayProcessor<'a> {
             ball_actor_id: None,
             player_actor_to_car_actor: HashMap::new(),
             player_to_actor_id: HashMap::new(),
+            car_actor_to_boost_actor: HashMap::new(),
+            car_actor_to_jump_actor: HashMap::new(),
+            car_actor_to_double_jump_actor: HashMap::new(),
+            car_actor_to_dodge_actor: HashMap::new(),
         }
     }
 
@@ -223,30 +258,54 @@ impl<'a> ReplayProcessor<'a> {
             self.update_player_to_car_mappings(frame)?;
             self.update_ball_id(frame)?;
             self.update_boost_amounts(frame)?;
-            self.add_frame_to_replay_data()?;
+            self.add_frame_to_replay_data(frame.time)?;
         }
 
         Ok(self.replay_data)
     }
 
-    fn add_frame_to_replay_data(&mut self) -> Result<(), String> {
+    fn add_frame_to_replay_data(&mut self, time: f32) -> Result<(), String> {
+        let metadata_frame = self.get_metadata_frame(time)?;
         let ball_frame = self.get_ball_frame()?;
         let player_frames = self.get_player_frames()?;
-        let frame_metadata = FrameMetadata::new();
         self.replay_data
-            .add_frame(frame_metadata, ball_frame, player_frames)?;
+            .add_frame(metadata_frame, ball_frame, player_frames)?;
         Ok(())
     }
 
-    fn get_object_id_for_type(&self, name: &str) -> Result<&boxcars::ObjectId, String> {
+    fn get_metadata_frame(&self, time: f32) -> Result<MetadataFrame, String> {
+        let actor_id = self
+            .get_actor_ids_by_type(GAME_TYPE)
+            .unwrap()
+            .iter()
+            .next()
+            .ok_or("No game actor")?;
+        let seconds_remaining = get_actor_attribute_matching!(
+            self,
+            actor_id,
+            SECONDS_REMAINING_KEY,
+            boxcars::Attribute::Int
+        )?;
+        println!("Seconds remaining: {:?}", seconds_remaining);
+        Ok(MetadataFrame::new(
+            time,
+            u8::try_from(*seconds_remaining).map_err(|_| "Seconds remaining conversion failed")?,
+        ))
+    }
+
+    fn get_object_id_for_key(&self, name: &str) -> Result<&boxcars::ObjectId, String> {
         self.name_to_object_id
             .get(name)
             .ok_or(format!("Could not get object id for name {:?}", name))
     }
 
-    fn get_actor_ids_by_name(&self, name: &str) -> Result<&[boxcars::ActorId], String> {
-        self.get_object_id_for_type(name)
+    fn get_actor_ids_by_type(&self, name: &str) -> Result<&[boxcars::ActorId], String> {
+        self.get_object_id_for_key(name)
             .map(|object_id| self.get_actor_ids_by_object_id(object_id))
+    }
+
+    fn get_actor_ids_vec(&self, name: &str) -> Result<Vec<boxcars::ActorId>, String> {
+        Ok(self.get_actor_ids_by_type(name)?.iter().cloned().collect())
     }
 
     fn get_actor_ids_by_object_id(&self, object_id: &boxcars::ObjectId) -> &[boxcars::ActorId] {
@@ -318,63 +377,70 @@ impl<'a> ReplayProcessor<'a> {
 
     fn get_ball_frame(&self) -> Result<BallFrame, String> {
         if let Some(actor_id) = self.ball_actor_id {
-            if let boxcars::Attribute::RigidBody(rigid_body) =
-                self.get_actor_attribute(&actor_id, &RIGID_BODY_STATE_KEY)?
-            {
-                Ok(BallFrame::from_data(rigid_body))
-            } else {
-                return Err(format!(
-                    "Could not get ball rigid body state. {:?} {}",
-                    actor_id,
-                    self.actor_state_string(&actor_id)
-                ));
-            }
+            let rigid_body = get_actor_attribute_matching!(
+                self,
+                &actor_id,
+                RIGID_BODY_STATE_KEY,
+                boxcars::Attribute::RigidBody
+            )?;
+            Ok(BallFrame::from_data(rigid_body))
         } else {
             return Ok(BallFrame::Empty);
         }
     }
 
     fn update_player_to_car_mappings(&mut self, frame: &boxcars::Frame) -> Result<(), String> {
-        let player_actor_ids: Vec<boxcars::ActorId> = self
-            .get_actor_ids_by_name(PLAYER_TYPE)?
-            .iter()
-            .cloned()
-            .collect();
-        let car_actor_ids: Vec<boxcars::ActorId> = self
-            .get_actor_ids_by_name(CAR_TYPE)?
-            .iter()
-            .cloned()
-            .collect();
-        let unique_id = self.get_object_id_for_type(UNIQUE_ID_KEY)?.clone();
-        let player_replication_id = self
-            .get_object_id_for_type(PLAYER_REPLICATION_TYPE)?
-            .clone();
-
         for update in frame.updated_actors.iter() {
-            if player_actor_ids.iter().any(|id| id == &update.actor_id) {
-                if update.object_id == unique_id {
-                    let unique_id = get_actor_attribute_matching!(
-                        self,
-                        &update.actor_id,
-                        UNIQUE_ID_KEY,
-                        boxcars::Attribute::UniqueId
-                    )?;
-                    self.player_to_actor_id
-                        .insert(*unique_id.clone(), update.actor_id);
-                }
+            macro_rules! maintain_actor_link {
+                ($map:expr, $actor_type:expr, $attr:expr, $get_key: expr, $type:path) => {{
+                    if &update.object_id == self.get_object_id_for_key(&$attr)? {
+                        if self
+                            .get_actor_ids_by_type($actor_type)?
+                            .iter()
+                            .any(|id| id == &update.actor_id)
+                        {
+                            let value = get_actor_attribute_matching!(
+                                self,
+                                &update.actor_id,
+                                $attr,
+                                $type
+                            )?;
+                            $map.insert($get_key(value), update.actor_id);
+                        }
+                    }
+                }};
             }
-            if car_actor_ids.iter().any(|id| id == &update.actor_id) {
-                if update.object_id == player_replication_id {
-                    let actor_info = get_actor_attribute_matching!(
-                        self,
-                        &update.actor_id,
-                        PLAYER_REPLICATION_TYPE,
+            maintain_actor_link!(
+                self.player_actor_to_car_actor,
+                CAR_TYPE,
+                PLAYER_REPLICATION_KEY,
+                get_actor_id,
+                boxcars::Attribute::ActiveActor
+            );
+            maintain_actor_link!(
+                self.player_to_actor_id,
+                PLAYER_TYPE,
+                UNIQUE_ID_KEY,
+                |unique_id: &Box<boxcars::UniqueId>| *unique_id.clone(),
+                boxcars::Attribute::UniqueId
+            );
+
+            macro_rules! maintain_vehicle_key_link {
+                ($map:expr, $actor_type:expr) => {
+                    maintain_actor_link!(
+                        $map,
+                        $actor_type,
+                        VEHICLE_KEY,
+                        get_actor_id,
                         boxcars::Attribute::ActiveActor
-                    )?;
-                    self.player_actor_to_car_actor
-                        .insert(actor_info.actor, update.actor_id);
-                }
+                    )
+                };
             }
+
+            maintain_vehicle_key_link!(self.car_actor_to_boost_actor, BOOST_TYPE);
+            maintain_vehicle_key_link!(self.car_actor_to_dodge_actor, DODGE_TYPE);
+            maintain_vehicle_key_link!(self.car_actor_to_jump_actor, JUMP_TYPE);
+            maintain_vehicle_key_link!(self.car_actor_to_double_jump_actor, DOUBLE_JUMP_TYPE);
         }
 
         for actor_id in frame.deleted_actors.iter() {
@@ -389,49 +455,145 @@ impl<'a> ReplayProcessor<'a> {
     }
 
     fn update_boost_amounts(&mut self, frame: &Frame) -> Result<(), String> {
-        for (actor_id, actor_state) in self.iter_actors_by_type_err(BOOST_TYPE)? {
-            let actor_value = get_attribute!(
-                self,
-                &actor_state.attributes,
-                BOOST_AMOUNT_KEY,
-                boxcars::Attribute::Byte
+        let updates: Vec<_> = self
+            .iter_actors_by_type_err(BOOST_TYPE)?
+            .map(|(actor_id, actor_state)| {
+                let (actor_amount_value, last_value, _, derived_value, is_active) =
+                    self.get_current_boost_values(actor_state);
+                let mut current_value = if actor_amount_value == last_value {
+                    // If we don't have an update in the actor, just continue using our derived value
+                    derived_value
+                } else {
+                    // If we do have an update in the actor, use that value.
+                    actor_amount_value.into()
+                };
+                if is_active {
+                    current_value -= frame.delta * BOOST_USED_PER_SECOND;
+                }
+                (actor_id.clone(), current_value.max(0.0), actor_amount_value)
+            })
+            .collect();
+
+        for (actor_id, current_value, new_last_value) in updates {
+            let derived_attributes = &mut self
+                .actor_state
+                .actor_states
+                .get_mut(&actor_id)
+                .unwrap()
+                .derived_attributes;
+
+            derived_attributes.insert(
+                LAST_BOOST_AMOUNT_KEY.to_string(),
+                boxcars::Attribute::Byte(new_last_value),
             );
-            let active_value = get_actor_attribute_matching!(
-                self,
-                actor_id,
-                COMPONENT_ACTIVE_KEY,
-                boxcars::Attribute::Byte
+            derived_attributes.insert(
+                BOOST_AMOUNT_KEY.to_string(),
+                boxcars::Attribute::Float(current_value),
             );
-            let new_value = actor_state
-                .derived_attributes
-                .get(&BOOST_AMOUNT_KEY.to_string());
         }
         Ok(())
     }
 
+    fn get_current_boost_values(&self, actor_state: &ActorState) -> (u8, u8, u8, f32, bool) {
+        let amount_value = get_attribute!(
+            self,
+            &actor_state.attributes,
+            BOOST_AMOUNT_KEY,
+            boxcars::Attribute::Byte
+        )
+        .cloned()
+        .unwrap_or(0);
+        let active_value = get_attribute!(
+            self,
+            &actor_state.attributes,
+            COMPONENT_ACTIVE_KEY,
+            boxcars::Attribute::Byte
+        )
+        .cloned()
+        .unwrap_or(0);
+        let is_active = active_value % 2 == 1;
+        let derived_value = actor_state
+            .derived_attributes
+            .get(&BOOST_AMOUNT_KEY.to_string())
+            .ok_or("No boost amount value.")
+            .cloned()
+            .and_then(|v| {
+                attribute_match!(
+                    v,
+                    boxcars::Attribute::Float,
+                    "Expected bool for derived value"
+                )
+            })
+            .unwrap_or(0.0);
+        let last_boost_amount = attribute_match!(
+            actor_state
+                .derived_attributes
+                .get(&LAST_BOOST_AMOUNT_KEY.to_string())
+                .cloned()
+                .unwrap_or_else(|| boxcars::Attribute::Byte(amount_value)),
+            boxcars::Attribute::Byte,
+            "Expected byte value"
+        )
+        .unwrap_or(0);
+        (
+            amount_value,
+            last_boost_amount,
+            active_value,
+            derived_value,
+            is_active,
+        )
+    }
+
     fn get_car_actor(&self, player_id: &PlayerId) -> Result<&ActorState, String> {
-        let player_actor_id = self.player_to_actor_id.get(&player_id).ok_or(format!(
-            "Could not find actor for player id {:?}",
-            player_id
-        ))?;
-        let car_actor_id = self
-            .player_actor_to_car_actor
-            .get(player_actor_id)
-            .ok_or(format!("Car actor for player {:?} not known.", player_id))?;
+        let car_actor_id = self.get_car_actor_id(player_id)?;
         self.actor_state
             .actor_states
-            .get(car_actor_id)
+            .get(&car_actor_id)
             .ok_or(format!("Car actor not found for id: {:?}", car_actor_id))
+    }
+
+    fn get_car_actor_id(&self, player_id: &PlayerId) -> Result<boxcars::ActorId, String> {
+        let player_actor_id = self
+            .player_to_actor_id
+            .get(&player_id)
+            .ok_or_else(|| format!("Could not find actor for player id {:?}", player_id))?;
+        self.player_actor_to_car_actor
+            .get(player_actor_id)
+            .ok_or_else(|| format!("Car actor for player {:?} not known.", player_id))
+            .cloned()
+    }
+
+    fn get_boost_actor_id(&self, player_id: &PlayerId) -> Result<boxcars::ActorId, String> {
+        self.car_actor_to_boost_actor
+            .get(&self.get_car_actor_id(player_id)?)
+            .ok_or_else(|| format!("Boost actor for player {:?} not found", player_id))
+            .cloned()
     }
 
     fn get_frame_for_player(&self, player_id: &PlayerId) -> Result<PlayerFrame, String> {
         let car_state = self.get_car_actor(player_id)?;
-        let attribute = self.get_attribute(&car_state.attributes, RIGID_BODY_STATE_KEY)?;
-        if let boxcars::Attribute::RigidBody(rigid_body) = attribute {
-            Ok(PlayerFrame::from_data(rigid_body.clone()))
-        } else {
-            Err(format!("Attribute: {:?} was not a rigid body", attribute))
-        }
+        let rigid_body = get_attribute!(
+            self,
+            &car_state.attributes,
+            RIGID_BODY_STATE_KEY,
+            boxcars::Attribute::RigidBody
+        )?;
+        let boost_state = self
+            .actor_state
+            .actor_states
+            .get(&self.get_boost_actor_id(player_id)?)
+            .ok_or(format!(
+                "Could not find boost actor for player, {:?}",
+                player_id
+            ))?;
+        let boost_amount = get_derived_attribute!(
+            boost_state.derived_attributes,
+            BOOST_AMOUNT_KEY,
+            boxcars::Attribute::Float
+        )?;
+
+        println!("{:?}: {:?}", player_id, boost_amount * 100.0 / 255.0);
+        Ok(PlayerFrame::from_data(rigid_body.clone(), *boost_amount))
     }
 
     fn get_player_frames(&self) -> Result<Vec<(PlayerId, PlayerFrame)>, String> {
@@ -442,10 +604,7 @@ impl<'a> ReplayProcessor<'a> {
                 (
                     player_id.clone(),
                     self.get_frame_for_player(player_id).unwrap_or_else(|e| {
-                        println!(
-                            "Error getting car for {:?}, {}, using empty frame",
-                            player_id, e
-                        );
+                        println!("Error frame for {:?}, {}", player_id, e);
                         PlayerFrame::Empty
                     }),
                 )
@@ -508,6 +667,24 @@ impl<'a> ReplayProcessor<'a> {
                 .map(|s| self.map_attribute_keys(s))
         )
     }
+
+    fn print_actors_of_type(&self, actor_type: &str) {
+        self.iter_actors_by_type(actor_type)
+            .unwrap()
+            .for_each(|(_actor_id, state)| {
+                println!("{:?}", self.map_attribute_keys(&state.attributes));
+            });
+    }
+
+    fn print_actor_types(&self) {
+        let types: Vec<_> = self
+            .actor_state
+            .actor_ids_by_type
+            .keys()
+            .filter_map(|id| self.object_id_to_name.get(id))
+            .collect();
+        println!("{:?}", types);
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -527,12 +704,18 @@ impl BallFrame {
 #[derive(Debug, Clone, PartialEq)]
 enum PlayerFrame {
     Empty,
-    Data { rigid_body: boxcars::RigidBody },
+    Data {
+        rigid_body: boxcars::RigidBody,
+        boost_amount: f32,
+    },
 }
 
 impl PlayerFrame {
-    fn from_data(rigid_body: boxcars::RigidBody) -> Self {
-        Self::Data { rigid_body }
+    fn from_data(rigid_body: boxcars::RigidBody, boost_amount: f32) -> Self {
+        Self::Data {
+            rigid_body,
+            boost_amount,
+        }
     }
 }
 
@@ -575,11 +758,17 @@ impl BallData {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct FrameMetadata {}
+struct MetadataFrame {
+    time: f32,
+    seconds_remaining: u8,
+}
 
-impl FrameMetadata {
-    fn new() -> Self {
-        FrameMetadata {}
+impl MetadataFrame {
+    fn new(time: f32, seconds_remaining: u8) -> Self {
+        MetadataFrame {
+            time,
+            seconds_remaining,
+        }
     }
 }
 
@@ -587,7 +776,7 @@ impl FrameMetadata {
 struct ReplayData {
     ball_data: BallData,
     players: HashMap<PlayerId, PlayerData>,
-    frame_metadata: Vec<FrameMetadata>,
+    frame_metadata: Vec<MetadataFrame>,
 }
 
 impl ReplayData {
@@ -601,7 +790,7 @@ impl ReplayData {
 
     fn add_frame(
         &mut self,
-        frame_metadata: FrameMetadata,
+        frame_metadata: MetadataFrame,
         ball_frame: BallFrame,
         player_frames: Vec<(PlayerId, PlayerFrame)>,
     ) -> Result<(), String> {
@@ -619,7 +808,7 @@ impl ReplayData {
 }
 
 fn main() {
-    let data = include_bytes!("../../assets/replays/good/21a81.replay");
+    let data = include_bytes!("../../aeda154d-a79c-490c-8c7f-0b8e9e43479d.replay");
     let parsing = boxcars::ParserBuilder::new(&data[..])
         .always_check_crc()
         .must_parse_network_data()
